@@ -56,9 +56,18 @@ class PythonFinder(BaseFinder, BasePath):
     roots = attr.ib(default=attr.Factory(defaultdict), type=defaultdict)
     #: List of paths discovered during search
     paths = attr.ib(type=list)
+    #: shim directory
+    shim_dir = attr.ib(default="shims", type=str)
     #: Versions discovered in the specified paths
     _versions = attr.ib(default=attr.Factory(defaultdict), type=defaultdict)
     _pythons = attr.ib(default=attr.Factory(defaultdict), type=defaultdict)
+
+    def __del__(self):
+        # type: () -> None
+        self._versions = defaultdict()
+        self._pythons = defaultdict()
+        self.roots = defaultdict()
+        self.paths = []
 
     @property
     def expanded_paths(self):
@@ -85,6 +94,7 @@ class PythonFinder(BaseFinder, BasePath):
             if not (p.parent.name == "envs" or p.name == "envs")
         ]
         versions = {v.name: v for v in version_paths}
+        version_order = []  # type: List[Path]
         if self.is_pyenv:
             version_order = [versions[v] for v in parse_pyenv_version_order() if v in versions]
         elif self.is_asdf:
@@ -118,7 +128,7 @@ class PythonFinder(BaseFinder, BasePath):
             bin_dir = self.get_bin_dir(p)
             if bin_dir.exists() and bin_dir.is_dir():
                 entry = PathEntry.create(
-                    path=bin_dir.absolute().as_posix(), only_python=False, name=p.name,
+                    path=bin_dir.absolute(), only_python=False, name=p.name,
                     is_root=True
                 )
                 self.roots[p] = entry
@@ -177,6 +187,7 @@ class PythonFinder(BaseFinder, BasePath):
 
     @paths.default
     def get_paths(self):
+        # type: () -> List[PathEntry]
         _paths = [base for _, base in self._iter_version_bases()]
         return _paths
 
@@ -206,7 +217,7 @@ class PythonFinder(BaseFinder, BasePath):
         root = ensure_path(root)
         if not version_glob_path:
             version_glob_path = "versions/*"
-        return cls(root=root, ignore_unsupported=ignore_unsupported,
+        return cls(root=root, path=root, ignore_unsupported=ignore_unsupported,
                    sort_function=sort_function, version_glob_path=version_glob_path)
 
     def find_all_python_versions(
@@ -234,19 +245,6 @@ class PythonFinder(BaseFinder, BasePath):
         :rtype: List[:class:`~pythonfinder.models.PathEntry`]
         """
 
-    #     version_matcher = operator.methodcaller(
-    #         "matches", major, minor, patch, pre, dev, arch, python_name=name
-    #     )
-    #     py = operator.attrgetter("as_python")
-    #     pythons = (
-    #         py_ver for py_ver in (py(p) for p in self._pythons.values() if p is not None)
-    #         if py_ver is not None
-    #     )
-    #     # pythons = filter(None, [p.as_python for p in self.pythons.values()])
-    #     matching_versions = filter(lambda py: version_matcher(py), pythons)
-    #     version_sort = operator.attrgetter("version_sort")
-    #     return sorted(matching_versions, key=version_sort, reverse=True)
-
         call_method = (
             "find_all_python_versions" if self.is_dir else "find_python_version"
         )
@@ -262,6 +260,7 @@ class PythonFinder(BaseFinder, BasePath):
             pythons = [
                 sub_finder(path) for path in self.paths
             ]
+        pythons = [p for p in pythons if p and p.is_python and p.as_python is not None]
         version_sort = operator.attrgetter("as_python.version_sort")
         paths = [
             p for p in sorted(list(pythons), key=version_sort, reverse=True)
@@ -298,26 +297,30 @@ class PythonFinder(BaseFinder, BasePath):
         )
         is_py = operator.attrgetter("is_python")
         py_version = operator.attrgetter("as_python")
-        call_method = (
-            "find_python_version"
-        )
         sub_finder = operator.methodcaller(
-            call_method, major, minor, patch, pre, dev, arch, name
+            "find_python_version", major, minor, patch, pre, dev, arch, name
         )
         version_sort = operator.attrgetter("as_python.version_sort")
+        unnested = [sub_finder(self.roots[path]) for path in self.roots]
         unnested = [
-            sub_finder(path) for path in self.roots
+            p for p in unnested
+            if p is not None and p.is_python and p.as_python is not None
         ]
         paths = sorted(list(unnested), key=version_sort, reverse=True)
         return next(iter(p for p in paths if p is not None), None)
 
-    #     version_matcher = operator.methodcaller(
-    #         "matches", major, minor, patch, pre, dev, arch, python_version=name
-    #     )
-    #     pythons = filter(None, [p.as_python for p in self._pythons.values()])
-    #     matching_versions = filter(lambda py: version_matcher(py), pythons)
-    #     version_sort = operator.attrgetter("version_sort")
-    #     return next(iter(c for c in sorted(matching_versions, key=version_sort, reverse=True)))
+    def which(self, name):
+        # type: (str) -> Optional[PathEntry]
+        """Search in this path for an executable.
+
+        :param executable: The name of an executable to search for.
+        :type executable: str
+        :returns: :class:`~pythonfinder.models.PathEntry` instance.
+        """
+
+        matches = (p.which(name) for p in self.paths)
+        non_empty_match = next(iter(m for m in matches if m is not None), None)
+        return non_empty_match
 
 
 @attr.s(slots=True)
@@ -489,19 +492,19 @@ class PythonVersion(object):
             path = PathEntry.create(path, is_root=False, only_python=True, name=name)
         from ..environment import IGNORE_UNSUPPORTED
         ignore_unsupported = ignore_unsupported or IGNORE_UNSUPPORTED
+        path_name = getattr(path, "name", path.path.name)  # str
         if not path.is_python:
             if not (ignore_unsupported or IGNORE_UNSUPPORTED):
                 raise ValueError("Not a valid python path: %s" % path.path)
         try:
-            name = getattr(path, "name", path.path.name)
-            instance_dict = cls.parse(name)
+            instance_dict = cls.parse(path_name)
         except Exception:
             py_version = get_python_version(path.path.absolute().as_posix())
             instance_dict = cls.parse(py_version.strip())
         if not isinstance(instance_dict.get("version"), Version) and not ignore_unsupported:
             raise ValueError("Not a valid python path: %s" % path)
-        if not name:
-            name = path.name
+        if name is None:
+            name = path_name
         instance_dict.update(
             {"comes_from": path, "name": name, "executable": path.path.as_posix()}
         )

@@ -63,15 +63,25 @@ class BasePath(object):
             for ext in KNOWN_EXTS
         ]
         children = self.children
-        found = next(
-            (
-                children[(self.path / child).as_posix()]
-                for child in valid_names
-                if (self.path / child).as_posix() in children
-            ),
-            None,
-        )
+        found = None
+        if self.path is not None:
+            found = next(
+                (
+                    children[(self.path / child).as_posix()]
+                    for child in valid_names
+                    if (self.path / child).as_posix() in children
+                ),
+                None,
+            )
         return found
+
+    def __del__(self):
+        for key in ["as_python", "is_dir", "is_python", "is_executable", "py_version"]:
+            if key in self.__dict__:
+                del self.__dict__[key]
+        self._children = {}
+        for key in self._pythons.keys():
+            del self._pythons[key]
 
     @property
     def children(self):
@@ -193,6 +203,14 @@ class BasePath(object):
         for entry in self.children.values():
             yield entry
 
+    def __next__(self):
+        # type: () -> Generator
+        return next(iter(self))
+
+    def next(self):
+        # type: () -> Generator
+        return self.__next__()
+
     def find_all_python_versions(
         self,
         major=None,  # type: Optional[Union[str, int]]
@@ -229,19 +247,9 @@ class BasePath(object):
         unnested = [
             sub_finder(path) for path in expand_paths(self)
         ]
-        # paths = [
-        #     p for p in unnested if
-        #     (p is not None and not p.is_dir and p.is_python and p.as_python is not None)
-        # ]
-        # path_filter = (
-        #     py for py in unnest(
-        #         sub_finder(p) for p in self.children.values() if p is not None
-        #     )
-        #     if py is not None and py.as_python is not None
-        # )
-        # return [c for c in sorted(path_filter, key=version_sort, reverse=True)]
         version_sort = operator.attrgetter("as_python.version_sort")
-        paths = sorted(list(unnested), key=version_sort, reverse=True)
+        unnested = [p for p in unnested if p is not None and p.as_python is not None]
+        paths = sorted(unnested, key=version_sort, reverse=True)
         return list(paths)
 
     def find_python_version(
@@ -277,8 +285,6 @@ class BasePath(object):
             if self.is_python and self.as_python and version_matcher(self.py_version):
                 return self  # type: ignore
             pass
-        # paths = [finder(path) for path in self.pythons.values() if path is not None]
-        # unnested = [unnest(path) for path in paths if path is not None and path.is_dir]
 
         matching_pythons = [
             [entry, entry.as_python.version_sort]
@@ -286,11 +292,6 @@ class BasePath(object):
             if (entry is not None and entry.as_python is not None and
                 version_matcher(entry.py_version))
         ]
-        # finder = (
-        #     (child, child.as_python)
-        #     for child in self.pythons.values()
-        #     if child is not None and child.as_python is not None
-        # )
         results = sorted(matching_pythons,
             key=operator.itemgetter(1),
             reverse=True,
