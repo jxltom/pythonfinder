@@ -497,10 +497,10 @@ class PythonVersion(object):
             if not (ignore_unsupported or IGNORE_UNSUPPORTED):
                 raise ValueError("Not a valid python path: %s" % path.path)
         try:
+            instance_dict = cls.parse(path_name)
+        except Exception:
             py_version = get_python_version(path.path.absolute().as_posix())
             instance_dict = cls.parse(py_version.strip())
-        except Exception:
-            instance_dict = cls.parse(path_name)
         if not isinstance(instance_dict.get("version"), Version) and not ignore_unsupported:
             raise ValueError("Not a valid python path: %s" % path)
         if name is None:
