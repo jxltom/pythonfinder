@@ -12,31 +12,27 @@ from collections import defaultdict
 import attr
 import six
 
-from packaging.version import LegacyVersion, Version
-from packaging.version import parse as parse_version
+from packaging.version import Version, parse as parse_version
 
-from vistir.compat import Path
+from vistir.compat import Path, lru_cache
 
 from ..environment import ASDF_DATA_DIR, MYPY_RUNNING, PYENV_ROOT, SYSTEM_ARCH
 from ..exceptions import InvalidPythonVersion
 from ..utils import (
     _filter_none, ensure_path, get_python_version, is_in_path,
     optional_instance_of, parse_asdf_version_order, parse_pyenv_version_order,
-    parse_python_version, unnest, expand_paths, RE_MATCHER
+    parse_python_version, unnest, RE_MATCHER, looks_like_python
 )
 from .mixins import BaseFinder, BasePath
 
 
 if MYPY_RUNNING:
-    from packaging.version import Version
     from typing import (
         DefaultDict, Optional, Callable, Generator, Any, Union, Tuple, List, Dict, Type,
         TypeVar, Iterator
     )
     from .path import PathEntry
     from .._vendor.pep514tools.environment import Environment
-
-    BaseFinderType = TypeVar("BaseFinderType")
 
 
 logger = logging.getLogger(__name__)
@@ -116,7 +112,6 @@ class PythonFinder(BaseFinder, BasePath):
     @classmethod
     def version_from_bin_dir(cls, entry):
         # type: (PathEntry) -> Optional[PathEntry]
-        from .path import PathEntry
         py_version = None
         py_version = next(iter(entry.find_all_python_versions()), None)
         return py_version
@@ -217,7 +212,7 @@ class PythonFinder(BaseFinder, BasePath):
         root = ensure_path(root)
         if not version_glob_path:
             version_glob_path = "versions/*"
-        return cls(root=root, path=root, ignore_unsupported=ignore_unsupported,
+        return cls(root=root, path=root, ignore_unsupported=ignore_unsupported,  # type: ignore
                    sort_function=sort_function, version_glob_path=version_glob_path)
 
     def find_all_python_versions(
@@ -292,11 +287,6 @@ class PythonFinder(BaseFinder, BasePath):
         :returns: A :class:`~pythonfinder.models.PathEntry` instance matching the version requested.
         """
 
-        version_matcher = operator.methodcaller(
-            "matches", major, minor, patch, pre, dev, arch, python_name=name
-        )
-        is_py = operator.attrgetter("is_python")
-        py_version = operator.attrgetter("as_python")
         sub_finder = operator.methodcaller(
             "find_python_version", major, minor, patch, pre, dev, arch, name
         )
@@ -337,6 +327,20 @@ class PythonVersion(object):
     comes_from = attr.ib(default=None)  # type: Optional[PathEntry]
     executable = attr.ib(default=None)  # type: Optional[str]
     name = attr.ib(default=None, type=str)
+
+    def __getattribute__(self, key):
+        result = super(PythonVersion, self).__getattribute__(key)
+        if key in ["minor", "patch"] and result is None:
+            executable = None  # type: Optional[str]
+            if self.executable:
+                executable = self.executable
+            elif self.comes_from:
+                executable = self.comes_from.path.as_posix()
+            if executable is not None:
+                instance_dict = self.parse_executable(executable)
+                self.update_metadata(instance_dict)
+                result = instance_dict.get(key)
+        return result
 
     @property
     def version_sort(self):
@@ -436,7 +440,26 @@ class PythonVersion(object):
             "version": self.version,
         }
 
+    def update_metadata(self, metadata):
+        # type: (Dict[str, Union[str, int, Version]]) -> None
+        """
+        Update the metadata on the current :class:`pythonfinder.models.python.PythonVersion`
+
+        Given a parsed version dictionary from :func:`pythonfinder.utils.parse_python_version`,
+        update the instance variables of the current version instance to reflect the newly
+        supplied values.
+        """
+
+        for key in metadata:
+            try:
+                current_value = getattr(self, key)
+            except AttributeError:
+                continue
+            else:
+                setattr(self, key, metadata[key])
+
     @classmethod
+    @lru_cache(maxsize=1024)
     def parse(cls, version):
         # type: (str) -> Dict[str, Union[str, int, Version]]
         """Parse a valid version string into a dictionary
@@ -444,13 +467,15 @@ class PythonVersion(object):
         Raises:
             ValueError -- Unable to parse version string
             ValueError -- Not a valid python version
+            TypeError -- NoneType or unparseable type passed in
 
-        :param version: A valid version string
-        :type version: str
+        :param str version: A valid version string
         :return: A dictionary with metadata about the specified python version.
-        :rtype: dict.
+        :rtype: dict
         """
 
+        if version is None:
+            raise TypeError("Must pass a value to parse!")
         version_dict = parse_python_version(str(version))
         if not version_dict:
             raise ValueError("Not a valid python version: %r" % version)
@@ -499,16 +524,38 @@ class PythonVersion(object):
         try:
             instance_dict = cls.parse(path_name)
         except Exception:
-            py_version = get_python_version(path.path.absolute().as_posix())
-            instance_dict = cls.parse(py_version.strip())
+            instance_dict = cls.parse_executable(path.path.absolute().as_posix())
+        else:
+            if instance_dict.get("minor") is None and looks_like_python(path.path.name):
+                instance_dict = cls.parse_executable(path.path.absolute().as_posix())
+
         if not isinstance(instance_dict.get("version"), Version) and not ignore_unsupported:
             raise ValueError("Not a valid python path: %s" % path)
+        if instance_dict.get("patch") is None:
+            instance_dict = cls.parse_executable(path.path.absolute().as_posix())
         if name is None:
             name = path_name
         instance_dict.update(
             {"comes_from": path, "name": name, "executable": path.path.as_posix()}
         )
         return cls(**instance_dict)  # type: ignore
+
+    @classmethod
+    @lru_cache(maxsize=1024)
+    def parse_executable(cls, path):
+        # type: (str) -> Dict[str, Optional[Union[str, int, Version]]]
+        result_dict = {}  # type: Dict[str, Optional[Union[str, int, Version]]]
+        result_version = None  # type: Optional[str]
+        if path is None:
+            raise TypeError("Must pass a valid path to parse.")
+        try:
+            result_version = get_python_version(path)
+        except Exception:
+            raise ValueError("Not a valid python path: %r" % path)
+        if result_version is None:
+            raise ValueError("Not a valid python path: %s" % path)
+        result_dict = cls.parse(result_version.strip())
+        return result_dict
 
     @classmethod
     def from_windows_launcher(cls, launcher_entry, name=None):

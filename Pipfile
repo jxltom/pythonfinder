@@ -17,8 +17,10 @@ black = {version = "*", markers = "python_version>='3.6'"}
 parver = "*"
 towncrier = "*"
 mypy = {version = "*", markers = "python_version>='3.4'"}
+mypy_extensions = "*"
 typed-ast = {version = "*", markers = "python_version>='3.3'"}
 lxml = "*"
+sphinx-autodoc-types = "*"
 
 [scripts]
 black = "python -m black src/pythonfinder"
